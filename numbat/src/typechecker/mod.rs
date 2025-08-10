@@ -400,6 +400,16 @@ impl TypeChecker {
                 let lhs_type = lhs_checked.get_type();
                 let rhs_type = rhs_checked.get_type();
 
+                let is_arith = matches!(
+                    op,
+                    BinaryOperator::Add
+                    | BinaryOperator::Sub
+                    | BinaryOperator::Mul
+                    | BinaryOperator::Div
+                    | BinaryOperator::Power
+                    | BinaryOperator::ConvertTo
+                );
+
                 if rhs_type.is_fn_type() && op == &BinaryOperator::ConvertTo {
                     let (parameter_types, return_type) = match rhs_type {
                         Type::Fn(p, r) => (p, r),
@@ -483,6 +493,43 @@ impl TypeChecker {
                             rhs.full_span(),
                         )));
                     }
+                } else if is_arith && (matches!(lhs_type, Type::List(_)) || matches!(rhs_type, Type::List(_)))     {
+                    use Type::List;
+
+                    let lt = match &lhs_type {
+                        List(et) => (*et.as_ref()).clone(),
+                        _ => lhs_type.clone(),
+                    };
+                    let rt = match &rhs_type {
+                        List(et) => (*et.as_ref()).clone(),
+                        _ => rhs_type.clone(),
+                    };
+
+                    let result_elem_ty: Type = match op {
+                        BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::ConvertTo => {
+                            self.enforce_dtype(&lt, lhs_checked.full_span())?;
+                            self.enforce_dtype(&rt, rhs_checked.full_span())?;
+                            lt.clone()
+                        }
+                        BinaryOperator::Mul | BinaryOperator::Div => {
+                            self.mul_div_result_type_from_types(*op, &lt, &lhs_checked, &rt, &rhs_checked)?
+                        }
+                        BinaryOperator::Power => {
+                            let tv = self.name_generator.fresh_type_variable();
+                            let ty = Type::TVar(tv);
+                            self.add_dtype_constraint(&ty).ok();
+                            ty
+                        }
+                        _ => unreachable!(),
+                    };
+
+                    typed_ast::Expression::BinaryOperator(
+                        *span_op,
+                        *op,
+                        Box::new(lhs_checked),
+                        Box::new(rhs_checked),
+                        TypeScheme::concrete(Type::List(Box::new(result_elem_ty))),
+                    )
                 } else {
                     let mut get_type_and_assert_equal_dtypes = || -> Result<Type> {
                         let lhs_type = lhs_checked.get_type();
@@ -553,87 +600,7 @@ impl TypeChecker {
                         typed_ast::BinaryOperator::Mul | typed_ast::BinaryOperator::Div => {
                             let type_lhs = lhs_checked.get_type();
                             let type_rhs = rhs_checked.get_type();
-
-                            if type_lhs.is_closed() && type_rhs.is_closed() {
-                                let lhs_dtype = dtype(&lhs_checked)?;
-                                let rhs_dtype = dtype(&rhs_checked)?;
-
-                                match op {
-                                    typed_ast::BinaryOperator::Mul => {
-                                        Type::Dimension(lhs_dtype.multiply(&rhs_dtype))
-                                    }
-                                    typed_ast::BinaryOperator::Div => {
-                                        Type::Dimension(lhs_dtype.divide(&rhs_dtype))
-                                    }
-                                    _ => unreachable!(),
-                                }
-                            } else {
-                                self.enforce_dtype(&type_lhs, lhs_checked.full_span())?;
-                                self.enforce_dtype(&type_rhs, rhs_checked.full_span())?;
-
-                                // We first introduce a fresh type variable for the result
-                                let tv_result = self.name_generator.fresh_type_variable();
-                                let type_result = Type::TVar(tv_result.clone());
-
-                                // … and make sure that it is a dimension type
-                                self.add_dtype_constraint(&type_result).ok();
-
-                                // We can't use type_lhs/type_rhs directly in a dimension expression, because
-                                // only DTypes can be used there. But we don't know if type_lhs/type_rhs are
-                                // indeed dimension types. So we make up new type variables tv_lhs/tv_rhs, and
-                                // add contraints type_lhs ~ type(tv_lhs), type_rhs ~ type(tv_rhs). We can then
-                                // use those type variables inside the dimension expression constraint.
-
-                                let tv_lhs = self.name_generator.fresh_type_variable();
-                                let tv_rhs = self.name_generator.fresh_type_variable();
-
-                                self.constraints
-                                    .add(Constraint::Equal(type_lhs, Type::TVar(tv_lhs.clone())))
-                                    .ok();
-                                self.constraints
-                                    .add(Constraint::Equal(type_rhs, Type::TVar(tv_rhs.clone())))
-                                    .ok();
-
-                                // we also need dtype constraints for those new type variables
-                                self.add_dtype_constraint(&Type::TVar(tv_lhs.clone())).ok();
-                                self.add_dtype_constraint(&Type::TVar(tv_rhs.clone())).ok();
-
-                                // Finally, we add the constraint that the result is the product of the two,
-                                // which we write as
-                                //
-                                //     dtype_lhs × dtype_rhs × dtype_result^-1 ~ Scalar
-                                //
-                                // Or for division:
-                                //
-                                //     dtype_lhs × dtype_rhs^-1 × dtype_result ~ Scalar
-                                //
-                                let dtype_lhs = DType::from_type_variable(tv_lhs);
-                                let dtype_rhs = DType::from_type_variable(tv_rhs);
-                                let dtype_result = DType::from_type_variable(tv_result);
-
-                                match op {
-                                    typed_ast::BinaryOperator::Mul => {
-                                        self.constraints
-                                            .add(Constraint::EqualScalar(
-                                                dtype_lhs
-                                                    .multiply(&dtype_rhs)
-                                                    .multiply(&dtype_result.inverse()),
-                                            ))
-                                            .ok();
-                                    }
-                                    typed_ast::BinaryOperator::Div => {
-                                        self.constraints
-                                            .add(Constraint::EqualScalar(
-                                                (dtype_lhs.divide(&dtype_rhs))
-                                                    .multiply(&dtype_result.inverse()),
-                                            ))
-                                            .ok();
-                                    }
-                                    _ => unreachable!(),
-                                }
-
-                                type_result
-                            }
+                            self.mul_div_result_type_from_types(*op, &type_lhs, &lhs_checked, &type_rhs, &rhs_checked)?                           
                         }
                         typed_ast::BinaryOperator::Power => {
                             let type_base_inferred = lhs_type;
@@ -1936,4 +1903,69 @@ impl TypeChecker {
     pub fn lookup_function(&self, name: &str) -> Option<(&FunctionSignature, &FunctionMetadata)> {
         self.env.get_function_info(name)
     }
+
+    fn mul_div_result_type_from_types(
+        &mut self,
+        op: BinaryOperator,
+        lhs_ty: &Type,
+        lhs_checked: &Expression<'_>,
+        rhs_ty: &Type,
+        rhs_checked: &Expression<'_>,
+    ) -> Result<Type> {
+        self.enforce_dtype(lhs_ty, lhs_checked.full_span())?;
+        self.enforce_dtype(rhs_ty, rhs_checked.full_span())?;
+
+        if let (Type::Dimension(dl), Type::Dimension(dr)) = (lhs_ty, rhs_ty) {
+            if lhs_ty.is_closed() && rhs_ty.is_closed() {
+                return Ok(Type::Dimension(match op {
+                    BinaryOperator::Mul => dl.multiply(dr),
+                    BinaryOperator::Div => dl.divide(dr),
+                    _ => unreachable!(),
+                }));
+            }
+        }
+
+        let tv_result = self.name_generator.fresh_type_variable();
+        let type_result = Type::TVar(tv_result.clone());
+        self.add_dtype_constraint(&type_result).ok();
+
+        let tv_lhs = self.name_generator.fresh_type_variable();
+        let tv_rhs = self.name_generator.fresh_type_variable();
+
+        self.constraints
+            .add(Constraint::Equal(lhs_ty.clone(), Type::TVar(tv_lhs.clone())))
+            .ok();
+        self.constraints
+            .add(Constraint::Equal(rhs_ty.clone(), Type::TVar(tv_rhs.clone())))
+            .ok();
+
+        self.add_dtype_constraint(&Type::TVar(tv_lhs.clone())).ok();
+        self.add_dtype_constraint(&Type::TVar(tv_rhs.clone())).ok();
+
+        let dtype_lhs = DType::from_type_variable(tv_lhs);
+        let dtype_rhs = DType::from_type_variable(tv_rhs);
+        let dtype_result = DType::from_type_variable(tv_result);
+
+        match op {
+            BinaryOperator::Mul => {
+                self.constraints
+                    .add(Constraint::EqualScalar(
+                        dtype_lhs.multiply(&dtype_rhs).multiply(&dtype_result.inverse()),
+                    ))
+                    .ok();
+            }
+            BinaryOperator::Div => {
+                self.constraints
+                    .add(Constraint::EqualScalar(
+                        dtype_lhs.divide(&dtype_rhs).multiply(&dtype_result.inverse()),
+                    ))
+                    .ok();
+            }
+            _ => unreachable!(),
+        }
+
+        Ok(type_result)
+    }
+
+
 }

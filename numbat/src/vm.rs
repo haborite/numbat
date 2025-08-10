@@ -684,22 +684,43 @@ impl Vm {
                 | Op::Divide
                 | Op::Power
                 | Op::ConvertTo) => {
-                    let rhs = self.pop_quantity();
-                    let lhs = self.pop_quantity();
-                    let result = match op {
-                        Op::Add => &lhs + &rhs,
-                        Op::Subtract => &lhs - &rhs,
-                        Op::Multiply => Ok(lhs * rhs),
-                        Op::Divide => {
-                            Ok(lhs.checked_div(rhs).ok_or(RuntimeError::DivisionByZero)?)
-                        }
-                        Op::Power => lhs.power(rhs),
-                        // If the user specifically converted the type of a unit, we should NOT simplify this value
-                        // before any operations are applied to it
-                        Op::ConvertTo => lhs.convert_to(rhs.unit()).map(Quantity::no_simplify),
+                    use Value::{List as VList, Quantity as VQty};
+
+                    let rhs = self.pop();
+                    let lhs = self.pop();
+
+                    // List ⊕ List
+                    if let (VList(l1), VList(l2)) = (&lhs, &rhs) {
+                        let out = self.elementwise_op_with_broadcast(op, l1, l2)?;
+                        self.push(Value::List(out));
+                        continue;
+                    }
+                    // List ⊕ Scalar
+                    if let (VList(l), VQty(q)) = (&lhs, &rhs) {
+                        let out = self.elementwise_op_with_scalar_broadcast_left(op, l, q)?;
+                        self.push(Value::List(out));
+                        continue;
+                    }
+                    // Scalar ⊕ List
+                    if let (VQty(q), VList(l)) = (&lhs, &rhs) {
+                        let out = self.elementwise_op_with_scalar_broadcast_right(op, q, l)?;
+                        self.push(Value::List(out));
+                        continue;
+                    }
+
+                    // Scalar ⊕ Scalar
+                    let rq = rhs.unsafe_as_quantity();
+                    let lq = lhs.unsafe_as_quantity();
+                    let res = match op {
+                        Op::Add      => &lq + &rq,
+                        Op::Subtract => &lq - &rq,
+                        Op::Multiply => Ok(lq * rq),
+                        Op::Divide   => Ok(lq.checked_div(rq).ok_or(RuntimeError::DivisionByZero)?),
+                        Op::Power    => lq.power(rq),
+                        Op::ConvertTo=> lq.convert_to(rq.unit()).map(Quantity::no_simplify),
                         _ => unreachable!(),
                     };
-                    self.push_quantity(result.map_err(RuntimeError::QuantityError)?);
+                    self.push_quantity(res.map_err(RuntimeError::QuantityError)?);
                 }
                 op @ (Op::AddToDateTime | Op::SubFromDateTime) => {
                     let rhs = self.pop_quantity();
@@ -1087,6 +1108,91 @@ impl Vm {
 
     fn print(&self, ctx: &mut ExecutionContext, m: &Markup) {
         (ctx.print_fn)(m);
+    }
+
+    fn elementwise_quantity_op(
+        &self, op: Op, a: &Quantity, b: &Quantity
+    ) -> Result<Quantity> {
+        use Op::*;
+        let r = match op {
+            Add      => &*a + &*b,
+            Subtract => &*a - &*b,
+            Multiply => Ok(a.clone() * b.clone()),
+            Divide   => Ok(a.clone().checked_div(b.clone()).ok_or(RuntimeError::DivisionByZero)?),
+            Power    => a.clone().power(b.clone()),
+            ConvertTo=> a.clone().convert_to(b.unit()).map(Quantity::no_simplify),
+            _ => unreachable!(),
+        };
+        r.map_err(|e| Box::new(RuntimeError::QuantityError(e)))
+    }
+
+    fn zip_broadcast<'a, T>(
+        l1: &'a NumbatList<T>, l2: &'a NumbatList<T>
+    ) -> Result<Box<dyn Iterator<Item=(&'a T, &'a T)> + 'a>> {
+        let n1 = l1.len();
+        let n2 = l2.len();
+        if n1 == n2 {
+            Ok(Box::new(l1.iter().zip(l2.iter())))
+        } else if n1 == 1 && n2 > 1 {
+            let a0 = l1.iter().next().unwrap();
+            Ok(Box::new(l2.iter().map(move |b| (a0, b))))
+        } else if n2 == 1 && n1 > 1 {
+            let b0 = l2.iter().next().unwrap();
+            Ok(Box::new(l1.iter().map(move |a| (a, b0))))
+        } else {
+            Err(Box::new(RuntimeError::MismatchedListLengths(n1, n2)))
+        }
+    }
+
+    fn elementwise_op_with_broadcast(
+        &self, op: Op, l1: &NumbatList<Value>, l2: &NumbatList<Value>
+    ) -> Result<NumbatList<Value>> {
+        let it = Self::zip_broadcast(l1, l2)?;
+        let mut out = NumbatList::with_capacity(std::cmp::max(l1.len(), l2.len()));
+        for (va, vb) in it {
+            match (va, vb) {
+                (Value::Quantity(a), Value::Quantity(b)) => {
+                    let q = self.elementwise_quantity_op(op, a, b)?;
+                    out.push_back(Value::Quantity(q));
+                }
+                _ => return Err(Box::new(RuntimeError::InvalidListElementForOp(
+                    "Only Quantity elements supported in list arithmetic"
+                ))),
+            }
+        }
+        Ok(out)
+    }
+
+    fn elementwise_op_with_scalar_broadcast_left(
+        &self, op: Op, l: &NumbatList<Value>, q: &Quantity
+    ) -> Result<NumbatList<Value>> {
+        let mut out = NumbatList::with_capacity(l.len());
+        for v in l.iter() {
+            if let Value::Quantity(a) = v {
+                out.push_back(Value::Quantity(self.elementwise_quantity_op(op, a, q)?));
+            } else {
+                return Err(Box::new(RuntimeError::InvalidListElementForOp(
+                    "Only Quantity elements supported in list arithmetic"
+                )));
+            }
+        }
+        Ok(out)
+    }
+
+    fn elementwise_op_with_scalar_broadcast_right(
+        &self, op: Op, q: &Quantity, l: &NumbatList<Value>
+    ) -> Result<NumbatList<Value>> {
+        let mut out = NumbatList::with_capacity(l.len());
+        for v in l.iter() {
+            if let Value::Quantity(b) = v {
+                out.push_back(Value::Quantity(self.elementwise_quantity_op(op, q, b)?));
+            } else {
+                return Err(Box::new(RuntimeError::InvalidListElementForOp(
+                    "Only Quantity elements supported in list arithmetic"
+                )));
+            }
+        }
+        Ok(out)
     }
 }
 

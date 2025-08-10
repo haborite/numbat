@@ -70,6 +70,12 @@ pub enum RuntimeError {
         "Could not write to history file {0:?}. History will not be saved until this is fixed."
     )]
     HistoryWrite(std::path::PathBuf),
+
+    #[error("List lengths do not match: left has {0} elements, right has {1} elements")]
+    MismatchedListLengths(usize, usize),
+
+    #[error("Invalid element type in list arithmetic: {0}")]
+    InvalidListElementForOp(&'static str),
 }
 
 #[derive(Debug, PartialEq)]
